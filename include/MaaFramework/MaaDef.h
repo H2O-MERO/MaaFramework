@@ -389,7 +389,7 @@ typedef uint64_t MaaWin32ScreencapMethod;
  * restores              | | PostMessageWithCursorPos     | Medium        | Maybe         | Briefly     | Yes                | Moves cursor
  * to target position, then restores              | | SendMessageWithWindowPos     | Medium        | Maybe         | No          | Yes |
  * Moves window to align target with cursor, then restores     | | PostMessageWithWindowPos     | Medium        | Maybe         | No | Yes
- * | Moves window to align target with cursor, then restores     | | Interception                 | Medium        | Yes           | No | No
+ * | Keeps target aligned with cursor throughout each gesture    | | Interception                 | Medium        | Yes           | No | No
  * | Driver-level input injection via the Interception driver    | | AnchoredTouch                | Medium        | Maybe         | No
  * | Yes                | Injects synthetic touch points, never moves the cursor       |
  *

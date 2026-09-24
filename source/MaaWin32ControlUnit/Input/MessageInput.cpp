@@ -56,6 +56,27 @@ void ensure_process_dpi_awareness_once()
     }();
 }
 
+int get_cursor_follow_rate(HWND hwnd)
+{
+    constexpr int DefaultRate = 60;
+    constexpr int MaxRate = 120;
+
+    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFOEXW monitor_info {};
+    monitor_info.cbSize = sizeof(monitor_info);
+    if (!monitor || !GetMonitorInfoW(monitor, &monitor_info)) {
+        return DefaultRate;
+    }
+
+    DEVMODEW display_mode {};
+    display_mode.dmSize = sizeof(display_mode);
+    if (!EnumDisplaySettingsW(monitor_info.szDevice, ENUM_CURRENT_SETTINGS, &display_mode) || display_mode.dmDisplayFrequency <= 1) {
+        return DefaultRate;
+    }
+
+    return std::clamp(static_cast<int>(display_mode.dmDisplayFrequency), DefaultRate, MaxRate);
+}
+
 }
 
 MessageInput::MessageInput(HWND hwnd, Config config)
@@ -65,8 +86,8 @@ MessageInput::MessageInput(HWND hwnd, Config config)
     if (config_.with_window_pos) {
         window_pos_guard_enabled_ = false;
     }
-    if (config_.with_window_pos && config_.track_hardware_mouse) {
-        tracking_thread_ = std::thread(&MessageInput::tracking_thread_func, this);
+    if (config_.with_window_pos && (config_.track_hardware_mouse || config_.follow_cursor_during_gesture) && !ensure_tracking_thread()) {
+        LogError << "Failed to initialize window position tracking";
     }
 }
 
@@ -80,8 +101,15 @@ MessageInput::~MessageInput()
     restore_pos();
     unblock_input();
     tracking_exit_ = true;
+    if (tracking_wakeup_) {
+        SetEvent(tracking_wakeup_);
+    }
     if (tracking_thread_.joinable()) {
         tracking_thread_.join();
+    }
+    if (tracking_wakeup_) {
+        CloseHandle(tracking_wakeup_);
+        tracking_wakeup_ = nullptr;
     }
 }
 
@@ -205,6 +233,8 @@ void MessageInput::restore_window_pos()
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
+    std::lock_guard lock(window_position_mutex_);
+
     LONG left = saved_window_rect_.left;
     LONG top = saved_window_rect_.top;
 
@@ -222,20 +252,25 @@ void MessageInput::restore_window_pos()
 
 void MessageInput::start_window_tracking(int x, int y)
 {
-    ++tracking_generation_;
+    std::lock_guard lock(window_tracking_gesture_mutex_);
     tracking_stop_generation_ = 0;
     tracking_stop_deadline_ticks_ = 0;
-    tracking_x_ = x;
-    tracking_y_ = y;
+    tracking_target_ = (static_cast<uint64_t>(static_cast<uint32_t>(x)) << 32) | static_cast<uint32_t>(y);
     pending_mouse_x_ = 0;
     pending_mouse_y_ = 0;
     has_pending_mouse_ = false;
+    has_pending_cursor_position_ = false;
+    ++tracking_generation_;
     s_active_instance_ = this;
     tracking_active_ = true;
+    if (tracking_wakeup_) {
+        SetEvent(tracking_wakeup_);
+    }
 }
 
 void MessageInput::request_stop_window_tracking()
 {
+    std::lock_guard lock(window_tracking_gesture_mutex_);
     if (!tracking_active_.load()) {
         return;
     }
@@ -243,10 +278,14 @@ void MessageInput::request_stop_window_tracking()
     // 记住当前 tracking 代次，避免旧的 stop 请求在后续 touch_move 重启 tracking 后误停新一轮会话。
     tracking_stop_generation_ = tracking_generation_.load();
     tracking_stop_deadline_ticks_ = (TrackingClock::now() + std::chrono::milliseconds(10)).time_since_epoch().count();
+    if (tracking_wakeup_) {
+        SetEvent(tracking_wakeup_);
+    }
 }
 
 void MessageInput::maybe_stop_window_tracking()
 {
+    std::lock_guard lock(window_tracking_gesture_mutex_);
     if (!tracking_active_.load()) {
         return;
     }
@@ -258,7 +297,7 @@ void MessageInput::maybe_stop_window_tracking()
     }
 
     // grace period 结束后先把最后一批硬件位移吃完，避免刚好落在 tracking 帧间隔中间时丢最后一小段拖动。
-    if (has_pending_mouse_.load()) {
+    if (has_pending_mouse_.load() || has_pending_cursor_position_.load()) {
         return;
     }
 
@@ -268,32 +307,54 @@ void MessageInput::maybe_stop_window_tracking()
         return;
     }
 
-    auto stop_generation = tracking_stop_generation_.load();
-    auto current_generation = tracking_generation_.load();
+    const auto stop_generation = tracking_stop_generation_.load();
+    const auto current_generation = tracking_generation_.load();
     if (stop_generation != 0 && stop_generation == current_generation) {
-        stop_window_tracking();
+        tracking_stop_generation_ = 0;
+        tracking_active_ = false;
+        MessageInput* expected = this;
+        s_active_instance_.compare_exchange_strong(expected, nullptr);
+        pending_mouse_x_ = 0;
+        pending_mouse_y_ = 0;
+        has_pending_mouse_ = false;
+        has_pending_cursor_position_ = false;
     }
 }
 
 void MessageInput::stop_window_tracking()
 {
+    std::lock_guard lock(window_tracking_gesture_mutex_);
     tracking_stop_generation_ = 0;
     tracking_stop_deadline_ticks_ = 0;
     tracking_active_ = false;
-    s_active_instance_ = nullptr;
+    MessageInput* expected = this;
+    s_active_instance_.compare_exchange_strong(expected, nullptr);
     pending_mouse_x_ = 0;
     pending_mouse_y_ = 0;
     has_pending_mouse_ = false;
+    has_pending_cursor_position_ = false;
+    if (tracking_wakeup_) {
+        SetEvent(tracking_wakeup_);
+    }
 }
 
 bool MessageInput::handle_hardware_mouse_move(const MSLLHOOKSTRUCT& mouse_info)
 {
-    // injected 事件来自我们自己的 SetCursorPos；再参与累加会形成自我反馈，窗口会被越带越偏。
-    if (mouse_info.flags & LLMHF_INJECTED) {
+    if (!tracking_active_.load()) {
         return false;
     }
 
-    if (!tracking_active_.load()) {
+    if (config_.follow_cursor_during_gesture && !mouse_lock_follow_active_.load()) {
+        pending_cursor_position_ =
+            (static_cast<uint64_t>(static_cast<uint32_t>(mouse_info.pt.x)) << 32) | static_cast<uint32_t>(mouse_info.pt.y);
+        if (!has_pending_cursor_position_.exchange(true) && tracking_wakeup_) {
+            SetEvent(tracking_wakeup_);
+        }
+        return false;
+    }
+
+    // injected 事件来自我们自己的 SetCursorPos；再参与累加会形成自我反馈，窗口会被越带越偏。
+    if (mouse_info.flags & LLMHF_INJECTED) {
         return false;
     }
 
@@ -360,6 +421,30 @@ bool MessageInput::move_window_to_align_cursor(int x, int y)
         return false;
     }
 
+    return move_window_to_align_cursor_position(x, y, cursor_pos);
+}
+
+bool MessageInput::move_window_to_align_cursor_position(
+    int x,
+    int y,
+    const POINT& cursor_pos,
+    bool require_active_tracking,
+    uint64_t required_tracking_generation)
+{
+    std::unique_lock lock(window_position_mutex_, std::defer_lock);
+    if (require_active_tracking) {
+        if (!lock.try_lock()) {
+            return false;
+        }
+    }
+    else {
+        lock.lock();
+    }
+
+    if (require_active_tracking && (!tracking_active_.load() || tracking_generation_.load() != required_tracking_generation)) {
+        return false;
+    }
+
     POINT pt = { 0, 0 };
     if (!ClientToScreen(hwnd_, &pt)) {
         LogError << "ClientToScreen failed" << VAR(hwnd_) << VAR(GetLastError());
@@ -379,18 +464,38 @@ bool MessageInput::move_window_to_align_cursor(int x, int y)
     int new_left = cursor_pos.x - x - border_x;
     int new_top = cursor_pos.y - y - border_y;
 
+    if (new_left == current_rect.left && new_top == current_rect.top) {
+        return true;
+    }
+
     if (!is_window_move_allowed(new_left, new_top, current_rect, "align cursor")) {
+        lock.unlock();
         abort_windowpos_operation("align cursor");
         return false;
     }
 
-    if (!SetWindowPos(hwnd_, nullptr, new_left, new_top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS)) {
+    constexpr UINT flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS;
+    if (!SetWindowPos(hwnd_, nullptr, new_left, new_top, 0, 0, flags)) {
         LogError << "SetWindowPos failed" << VAR(hwnd_) << VAR(new_left) << VAR(new_top) << VAR(GetLastError());
+        lock.unlock();
         abort_windowpos_operation("align cursor SetWindowPos failed");
         return false;
     }
 
     return true;
+}
+
+bool MessageInput::move_tracking_window_to_cursor(const POINT& cursor_pos)
+{
+    if (!tracking_active_.load()) {
+        return false;
+    }
+
+    const uint64_t tracking_generation = tracking_generation_.load();
+    const uint64_t packed_target = tracking_target_.load();
+    const int target_x = static_cast<int32_t>(packed_target >> 32);
+    const int target_y = static_cast<int32_t>(packed_target & UINT32_MAX);
+    return move_window_to_align_cursor_position(target_x, target_y, cursor_pos, true, tracking_generation);
 }
 
 bool MessageInput::is_window_move_allowed(int new_left, int new_top, const RECT& current_rect, const char* reason)
@@ -526,7 +631,12 @@ bool MessageInput::prepare_mouse_position(int x, int y)
     }
 
     if (config_.with_window_pos) {
-        if (config_.track_hardware_mouse) {
+        if ((config_.track_hardware_mouse || config_.follow_cursor_during_gesture) && !ensure_tracking_thread()) {
+            LogError << "Failed to initialize cursor tracking";
+            return false;
+        }
+
+        if (config_.track_hardware_mouse || config_.follow_cursor_during_gesture) {
             start_window_tracking(x, y);
         }
 
@@ -540,7 +650,7 @@ bool MessageInput::prepare_mouse_position(int x, int y)
     return true;
 }
 
-// WH_MOUSE_LL 钩子回调：累加硬件鼠标位移 delta 并拦截，由追踪线程按固定帧率批量释放
+// 传统模式会批量累加并拦截硬件位移；手势跟随模式只记录最新坐标并立即放行。
 LRESULT CALLBACK MessageInput::MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
     if (nCode != HC_ACTION || wParam != WM_MOUSEMOVE) {
@@ -626,8 +736,9 @@ void MessageInput::process_pending_mouse_frame()
     // 原子读取并清零累积的 delta（exchange 保证不丢失并发写入）
     int dx = pending_mouse_x_.exchange(0);
     int dy = pending_mouse_y_.exchange(0);
-    int tx = tracking_x_;
-    int ty = tracking_y_;
+    const uint64_t packed_target = tracking_target_.load();
+    const int tx = static_cast<int32_t>(packed_target >> 32);
+    const int ty = static_cast<int32_t>(packed_target & UINT32_MAX);
 
     // 基于当前真实光标位置 + 累积 delta 计算目标光标位置
     POINT cursor;
@@ -730,16 +841,53 @@ void MessageInput::tracking_thread_func()
     }
     tracking_state_cv_.notify_all();
 
-    // 60fps 节流：每帧间隔约 16.67ms
     using clock = std::chrono::steady_clock;
     static constexpr auto frame_interval = std::chrono::nanoseconds(1'000'000'000 / 60);
+    const int cursor_follow_rate = get_cursor_follow_rate(hwnd_);
+    const auto cursor_follow_interval = std::chrono::nanoseconds(1'000'000'000 / cursor_follow_rate);
+    if (config_.follow_cursor_during_gesture) {
+        LogInfo << "Cursor-follow tracking initialized" << VAR(cursor_follow_rate);
+    }
+
     auto last_frame = clock::now();
+    auto last_cursor_follow_frame = clock::now() - cursor_follow_interval;
+    POINT last_cursor_position = { 0, 0 };
+    bool last_cursor_position_valid = false;
 
     MSG msg;
     while (!tracking_exit_) {
+        const auto before_wait = clock::now();
+        const bool tracking_active = tracking_active_.load();
+        const bool cursor_follow_active = tracking_active && config_.follow_cursor_during_gesture && !mouse_lock_follow_active_.load();
+        DWORD wait_timeout = INFINITE;
+        auto limit_wait_until = [&](clock::time_point deadline) {
+            if (deadline <= before_wait) {
+                wait_timeout = 0;
+                return;
+            }
+
+            const auto wait_ms = std::chrono::ceil<std::chrono::milliseconds>(deadline - before_wait).count();
+            const auto candidate = static_cast<DWORD>(std::clamp<int64_t>(wait_ms, 1, MAXDWORD - 1));
+            if (wait_timeout == INFINITE || candidate < wait_timeout) {
+                wait_timeout = candidate;
+            }
+        };
+
+        if (cursor_follow_active && has_pending_cursor_position_.load()) {
+            limit_wait_until(last_cursor_follow_frame + cursor_follow_interval);
+        }
+        else if (tracking_active && (mouse_lock_follow_active_.load() || has_pending_mouse_.load())) {
+            limit_wait_until(last_frame + frame_interval);
+        }
+
+        const auto stop_deadline_ticks = tracking_stop_deadline_ticks_.load();
+        if (tracking_active && stop_deadline_ticks != 0) {
+            limit_wait_until(clock::time_point(clock::duration(stop_deadline_ticks)));
+        }
+
         // 消息泵：WH_MOUSE_LL 钩子回调和 WM_INPUT 消息在此线程上被系统调度
-        DWORD res = MsgWaitForMultipleObjects(0, NULL, FALSE, 1, QS_ALLINPUT);
-        if (res == WAIT_OBJECT_0) {
+        DWORD res = MsgWaitForMultipleObjects(1, &tracking_wakeup_, FALSE, wait_timeout, QS_ALLINPUT);
+        if (res == WAIT_OBJECT_0 + 1) {
             while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
                 if (msg.message == WM_QUIT) {
                     tracking_exit_ = true;
@@ -751,7 +899,8 @@ void MessageInput::tracking_thread_func()
         }
 
         auto now = clock::now();
-        bool frame_ready = (now - last_frame) >= frame_interval;
+        const bool frame_ready = (now - last_frame) >= frame_interval;
+        const bool cursor_follow_frame_ready = (now - last_cursor_follow_frame) >= cursor_follow_interval;
 
         bool ensure_rawinput = false;
         {
@@ -769,13 +918,33 @@ void MessageInput::tracking_thread_func()
             tracking_state_cv_.notify_all();
         }
 
-        if (tracking_active_.load() && frame_ready) {
-            if (mouse_lock_follow_active_) {
+        if (tracking_active_.load()) {
+            if (config_.follow_cursor_during_gesture && !mouse_lock_follow_active_.load() && cursor_follow_frame_ready
+                && has_pending_cursor_position_.exchange(false)) {
+                const uint64_t packed_cursor = pending_cursor_position_.load();
+                POINT cursor_pos = {
+                    static_cast<int32_t>(packed_cursor >> 32),
+                    static_cast<int32_t>(packed_cursor & UINT32_MAX),
+                };
+
+                if (!last_cursor_position_valid || cursor_pos.x != last_cursor_position.x || cursor_pos.y != last_cursor_position.y) {
+                    if (move_tracking_window_to_cursor(cursor_pos)) {
+                        last_cursor_position = cursor_pos;
+                        last_cursor_position_valid = true;
+                    }
+                    else if (tracking_active_.load()) {
+                        has_pending_cursor_position_ = true;
+                        SetEvent(tracking_wakeup_);
+                    }
+                }
+                last_cursor_follow_frame = now;
+            }
+            else if (frame_ready && mouse_lock_follow_active_) {
                 // MouseLockFollow 模式：始终处理帧（即使没有新输入也要覆盖游戏的 SetCursorPos）
                 process_mouse_lock_follow_frame();
                 last_frame = now;
             }
-            else if (has_pending_mouse_.load()) {
+            else if (frame_ready && has_pending_mouse_.load()) {
                 // 普通 WithWindowPos 模式：仅在有新输入时处理
                 process_pending_mouse_frame();
                 last_frame = now;
@@ -842,7 +1011,7 @@ std::pair<int, int> MessageInput::get_target_pos() const
     }
 
     // 未设置时返回窗口客户区中心
-    RECT rect = { };
+    RECT rect = {};
     if (hwnd_ && GetClientRect(hwnd_, &rect)) {
         return { (rect.right - rect.left) / 2, (rect.bottom - rect.top) / 2 };
     }
@@ -1048,16 +1217,21 @@ bool MessageInput::touch_up(int contact)
         return false;
     }
     auto target_pos = get_target_pos();
+    const bool position_prepared = !config_.follow_cursor_during_gesture || prepare_mouse_position(target_pos.first, target_pos.second);
     LPARAM lParam = make_mouse_lparam(target, target_pos.first, target_pos.second);
 
     if (!send_or_post_w(target, msg_info.message, msg_info.w_param, lParam)) {
         restore_pos();
         return false;
     }
+    if (!position_prepared) {
+        restore_pos();
+        return false;
+    }
 
     // Match the tracked WindowPos lifecycle: successful gestures keep the window at its current
     // offset. inactive(), destruction, and failure paths restore the saved position.
-    if (config_.with_window_pos && config_.track_hardware_mouse) {
+    if (config_.with_window_pos && (config_.track_hardware_mouse || config_.follow_cursor_during_gesture)) {
         request_stop_window_tracking();
     }
     else if (!config_.with_window_pos) {
@@ -1175,7 +1349,7 @@ bool MessageInput::scroll(int dx, int dy)
         success &= send_or_post_w(target, WM_MOUSEHWHEEL, wParam, lParam);
     }
 
-    if (config_.with_window_pos && config_.track_hardware_mouse) {
+    if (config_.with_window_pos && (config_.track_hardware_mouse || config_.follow_cursor_during_gesture)) {
         request_stop_window_tracking();
     }
     else if (!config_.with_window_pos) {
@@ -1199,7 +1373,7 @@ bool MessageInput::relative_move(int dx, int dy)
     // 标记：这次 SendInput 产生的 WM_INPUT 不要被 RawInput handler 对冲
     counter_pending_++;
 
-    INPUT input = { };
+    INPUT input = {};
     input.type = INPUT_MOUSE;
     input.mi.dx = dx;
     input.mi.dy = dy;
@@ -1231,6 +1405,14 @@ bool MessageInput::set_mouse_lock_follow(bool enabled)
 
 bool MessageInput::ensure_tracking_thread()
 {
+    if (!tracking_wakeup_) {
+        tracking_wakeup_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!tracking_wakeup_) {
+            LogError << "CreateEventW failed for tracking wakeup" << VAR(GetLastError());
+            return false;
+        }
+    }
+
     auto wait_for_init = [this]() {
         std::unique_lock lock(tracking_state_mutex_);
         tracking_state_cv_.wait(lock, [this]() { return tracking_thread_init_done_ || tracking_exit_.load(); });
@@ -1252,6 +1434,7 @@ bool MessageInput::ensure_tracking_thread()
         rawinput_ensure_done_ = false;
         rawinput_ensure_ok_ = false;
     }
+    SetEvent(tracking_wakeup_);
     tracking_exit_ = false;
     tracking_thread_ = std::thread(&MessageInput::tracking_thread_func, this);
     if (!config_.with_window_pos) {
@@ -1271,6 +1454,7 @@ bool MessageInput::ensure_rawinput_window()
         rawinput_ensure_done_ = false;
         rawinput_ensure_ok_ = false;
     }
+    SetEvent(tracking_wakeup_);
 
     std::unique_lock lock(tracking_state_mutex_);
     tracking_state_cv_.wait(lock, [this]() { return rawinput_ensure_done_ || !tracking_thread_init_ok_ || tracking_exit_.load(); });
@@ -1408,6 +1592,7 @@ bool MessageInput::activate_mouse_lock_follow()
     mouse_lock_follow_active_ = true;
     s_active_instance_ = this;
     tracking_active_ = true;
+    SetEvent(tracking_wakeup_);
     activated = true;
 
     LogInfo << "Mouse lock follow activated" << VAR(lock_anchor_cursor_.x) << VAR(lock_anchor_cursor_.y) << VAR(lock_anchor_window_.left)
@@ -1438,6 +1623,9 @@ void MessageInput::deactivate_mouse_lock_follow()
     // 如果追踪线程是为 lock follow 单独启动的，停止它
     if (tracking_thread_started_for_lock_follow_ && !config_.with_window_pos) {
         tracking_exit_ = true;
+        if (tracking_wakeup_) {
+            SetEvent(tracking_wakeup_);
+        }
         if (tracking_thread_.joinable()) {
             tracking_thread_.join();
         }
@@ -1488,7 +1676,7 @@ void MessageInput::process_mouse_lock_follow_frame()
 
 bool MessageInput::create_rawinput_window()
 {
-    WNDCLASSEXW wc = { };
+    WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = RawInputWndProc;
     wc.hInstance = GetModuleHandleW(NULL);
@@ -1504,7 +1692,7 @@ bool MessageInput::create_rawinput_window()
     }
 
     // 注册接收鼠标 RawInput（RIDEV_INPUTSINK 确保后台也能收到）
-    RAWINPUTDEVICE rid = { };
+    RAWINPUTDEVICE rid = {};
     rid.usUsagePage = 0x01; // HID_USAGE_PAGE_GENERIC
     rid.usUsage = 0x02;     // HID_USAGE_GENERIC_MOUSE
     rid.dwFlags = RIDEV_INPUTSINK;
@@ -1526,7 +1714,7 @@ void MessageInput::destroy_rawinput_window()
         return;
     }
 
-    RAWINPUTDEVICE rid = { };
+    RAWINPUTDEVICE rid = {};
     rid.usUsagePage = 0x01;
     rid.usUsage = 0x02;
     rid.dwFlags = RIDEV_REMOVE;
@@ -1545,7 +1733,7 @@ void MessageInput::send_counter_move(int raw_dx, int raw_dy)
 
     counter_pending_++;
 
-    INPUT counter = { };
+    INPUT counter = {};
     counter.type = INPUT_MOUSE;
     counter.mi.dx = -raw_dx;
     counter.mi.dy = -raw_dy;
@@ -1568,7 +1756,7 @@ bool MessageInput::handle_rawinput_message(LPARAM lParam)
         return false;
     }
 
-    RAWINPUT raw = { };
+    RAWINPUT raw = {};
     UINT copied = size;
     if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, &raw, &copied, sizeof(RAWINPUTHEADER)) != size) {
         return false;

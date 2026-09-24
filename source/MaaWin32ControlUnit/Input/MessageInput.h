@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
 #include <thread>
 
@@ -28,6 +29,7 @@ public:
         bool with_cursor_pos = false;
         bool with_window_pos = false;
         bool track_hardware_mouse = true;
+        bool follow_cursor_during_gesture = false;
         bool block_input = false;
     };
 
@@ -80,6 +82,13 @@ private:
 
     // WithWindowPos 模式：移动窗口使客户区坐标 (x,y) 与当前鼠标位置重合
     bool move_window_to_align_cursor(int x, int y);
+    bool move_window_to_align_cursor_position(
+        int x,
+        int y,
+        const POINT& cursor_pos,
+        bool require_active_tracking = false,
+        uint64_t required_tracking_generation = 0);
+    bool move_tracking_window_to_cursor(const POINT& cursor_pos);
     bool is_window_move_allowed(int new_left, int new_top, const RECT& current_rect, const char* reason);
     void abort_windowpos_operation(const char* reason);
     void reset_windowpos_guard_state();
@@ -115,11 +124,17 @@ private:
     std::thread tracking_thread_;
     std::atomic_bool tracking_exit_ = false;
     std::atomic_bool tracking_active_ = false;
-    std::atomic_int tracking_x_ = 0;
-    std::atomic_int tracking_y_ = 0;
+    std::atomic_uint64_t tracking_target_ = 0;
     std::atomic_uint64_t tracking_generation_ = 0;
     std::atomic_uint64_t tracking_stop_generation_ = 0;
     std::atomic<TrackingDeadlineTicks> tracking_stop_deadline_ticks_ = 0;
+    HANDLE tracking_wakeup_ = nullptr;
+    std::mutex window_tracking_gesture_mutex_;
+    std::mutex window_position_mutex_;
+
+    // 钩子只保留最新光标位置，由追踪线程限频合并处理，避免高回报率鼠标放大窗口移动开销。
+    std::atomic_uint64_t pending_cursor_position_ = 0;
+    std::atomic_bool has_pending_cursor_position_ = false;
 
     // 钩子先累积硬件鼠标位移，再由 tracking 线程按固定帧率统一释放，避免每次移动都同步挪窗。
     std::atomic_int pending_mouse_x_ = 0;
@@ -182,8 +197,8 @@ private:
     std::atomic<bool> mouse_lock_follow_active_ = false;
     bool tracking_thread_started_for_lock_follow_ = false;
 
-    POINT lock_anchor_cursor_ = { };
-    RECT lock_anchor_window_ = { };
+    POINT lock_anchor_cursor_ = {};
+    RECT lock_anchor_window_ = {};
     int lock_offset_x_ = 0;
     int lock_offset_y_ = 0;
 };
